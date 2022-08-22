@@ -3,10 +3,12 @@
 #include <string.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <limits.h>
 #include <ext.h>
 #include <mint/osbind.h>
 
-static long errcount = 0;
+static long errcount;
+static long pass;
 
 __attribute__((noreturn))
 static void quit(char is_err, const char *fmt, ...)
@@ -55,15 +57,19 @@ static void check_user_interruption(void)
 	if (Cconis()) {
 		/* user keyboard interrupt */
 		getchar();
-		print_full_line(1, "Test interrupted. %ld errors detected.", errcount);
+		print_full_line(1, "Interrupted. Pass %ld, %ld errors.", pass, errcount);
 		quit(1, "");
 	}
+}
+
+static void print_progress(long pass, const char *op, short startsec, short nsec, long bytes)
+{
+	print_full_line(0, "Pass %ld %s [%d,%d[ %d sec %ldB", pass, op, startsec, startsec + nsec, nsec, bytes);
 }
 
 int main(int argc, char **argv)
 {
 	char drive, dev;
-	int opt;
 
 	printf("DMATEST by benou - ben@benou.fr\r\n\r\n");
 
@@ -102,11 +108,7 @@ int main(int argc, char **argv)
 		quit(1, "Inconsistent BPB detected for dev %d.", dev);
 
 	short totsec = bpb->numcl * bpb->clsiz;
-
-	printf("Floppy: %c\r\n", drive);
-	printf("Bytes per sector: %d\r\n", bpb->recsiz);
-	printf("Test start sector: %d\r\n", bpb->datrec);
-	printf("Test total sectors: %d\r\n", totsec);
+	printf("Floppy %c, %d sec %dB/sec\r\n", drive, totsec + bpb->datrec, bpb->recsiz);
 
 	/* find the biggest number of sectors that can be read at once
 	 * IOW the max number of sectors for which we can allocate memory for both the read and write buffers */
@@ -125,56 +127,63 @@ int main(int argc, char **argv)
 	if (!buf)
 		quit(1, "Unable to allocate a minimum of %d bytes", bufsz);
 
-	memset(buf, 0xae, bufsz);
+	short startsec = bpb->datrec;
+	short endsec = bpb->datrec + totsec - totsec % maxsec;
 
-	printf("Max sectors: %d\r\n", maxsec);
-	printf("Write buffer: %p (%ld bytes)\r\n", buf, bufsz);
-	printf("Read buffer: %p (%ld bytes)\r\n\n", buf + bufsz, bufsz);
+	printf("Test sec [%d,%d[, max IO %d sec\r\n\n", startsec, endsec, maxsec);
 
 	printf("Press any key to interrupt the test\r\n");
-	printf("(on-going I/O must complete though).\r\n\n");
+	printf("(on-going IO must complete though).\r\n\n");
 
-	long errcount = 0;
-	for (short startsec = bpb->datrec; startsec <= bpb->datrec + totsec - maxsec; startsec += maxsec) {
+	for (pass = 1; pass < LONG_MAX; pass++) {
+		for (short cursec = startsec; cursec < endsec; cursec += maxsec) {
+			long bytes = bpb->recsiz;
+			for (short nsec = 1; nsec <= maxsec; nsec *= 2, bytes *= 2) {
 
-		long bytes = bpb->recsiz;
-		for (short nsec = 1; nsec <= maxsec; nsec *= 2, bytes *= 2) {
+				check_user_interruption();
 
-			check_user_interruption();
+				/* use a different write pattern each time */
+				char pattern = rand();
+				/* write buffer is initialized with the pattern */
+				memset(buf, pattern, bytes);
+				/* read buffer is initialized with the opposite */
+				memset(buf+bufsz, ~pattern, bytes);
 
-			print_full_line(0, "Writing %ldB %d sectors [%d,%d[", bytes, nsec, startsec, startsec + nsec);
-			long err = Rwabs(1 /* write */, buf, nsec, startsec, dev);
-			if (err) {
-				fprintf(stderr, "\r\nWrite error %lx\r\n", err);
-				errcount++;
-			}
+				check_user_interruption();
 
-			check_user_interruption();
-
-			print_full_line(0, "Reading %ldB %d sectors [%d,%d[", bytes, nsec, startsec, startsec + nsec);
-			memset(buf + bufsz, 0x56, bytes);
-			err = Rwabs(0 /* read */, buf + bufsz, nsec, startsec, dev);
-			if (err) {
-				fprintf(stderr, "\r\nRead error %lx\r\n", err);
-				errcount++;
-			}
-
-			check_user_interruption();
-
-			print_full_line(0, "Checking %ldB %d sectors [%d,%d[", bytes, nsec, startsec, startsec + nsec);
-			if (!err && memcmp(buf, buf + bufsz, bytes)) {
-				fprintf(stderr, "\r\nRead buffer does not match write buffer\r\n");
-				for (long i=0; i<bytes; i++) {
-					if (buf[i] != buf[bufsz+i]) {
-						printf("[%d] %0.2x != %0.2x\r\n", i, buf[i], buf[bufsz+i]);
-						break;
-					}
+				print_progress(pass, "Wr ", cursec, nsec, bytes);
+				long err = Rwabs(3 /* write */, buf, nsec, cursec, dev);
+				if (err) {
+					fprintf(stderr, "\r\nWrite error (%ld)\r\n", err);
+					errcount++;
 				}
-				errcount++;
+
+				check_user_interruption();
+
+				print_progress(pass, "Rd ", cursec, nsec, bytes);
+				err = Rwabs(2 /* read */, buf + bufsz, nsec, cursec, dev);
+				if (err) {
+					fprintf(stderr, "\r\nRead error (%ld)\r\n", err);
+					errcount++;
+				}
+
+				check_user_interruption();
+
+				print_progress(pass, "Chk", cursec, nsec, bytes);
+				if (!err && memcmp(buf, buf + bufsz, bytes)) {
+					fprintf(stderr, "\r\nRead buffer does not match write buffer\r\n");
+					for (long i=0; i<bytes; i++) {
+						if (buf[i] != buf[bufsz+i]) {
+							printf("1st error @%d Wr %0.2x != Rd %0.2x\r\n", i, buf[i], buf[bufsz+i]);
+							break;
+						}
+					}
+					errcount++;
+				}
 			}
 		}
 	}
 
-	print_full_line(0, "Test end. %ld errors detected.", errcount);
+	print_full_line(0, "Test end. Pass %ld, %ld errors.", pass, errcount);
 	quit(0, "");
 }
